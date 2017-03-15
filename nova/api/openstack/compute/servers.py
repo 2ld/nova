@@ -565,6 +565,12 @@ class Controller(wsgi.Controller):
             if 'changes-since' not in search_opts:
                 # No 'changes-since', so we only want non-deleted servers
                 search_opts['deleted'] = False
+        else:
+            # Convert deleted filter value to a valid boolean.
+            # Return non-deleted servers if an invalid value
+            # is passed with deleted filter.
+            search_opts['deleted'] = strutils.bool_from_string(
+                search_opts['deleted'], default=False)
 
         if search_opts.get("vm_state") == ['deleted']:
             if context.is_admin:
@@ -572,6 +578,21 @@ class Controller(wsgi.Controller):
             else:
                 msg = _("Only administrators may list deleted instances")
                 raise exc.HTTPForbidden(explanation=msg)
+
+        # If tenant_id is passed as a search parameter this should
+        # imply that all_tenants is also enabled unless explicitly
+        # disabled. Note that the tenant_id parameter is filtered out
+        # by remove_invalid_options above unless the requestor is an
+        # admin.
+        if 'tenant_id' in search_opts and 'all_tenants' not in search_opts:
+            # We do not need to add the all_tenants flag if the tenant
+            # id associated with the token is the tenant id
+            # specified. This is done so a request that does not need
+            # the all_tenants flag does not fail because of lack of
+            # policy permission for compute:get_all_tenants when it
+            # doesn't actually need it.
+            if context.project_id != search_opts.get('tenant_id'):
+                search_opts['all_tenants'] = 1
 
         # If all tenants is passed with 0 or false as the value
         # then remove it from the search options. Nothing passed as
@@ -1449,32 +1470,11 @@ class Controller(wsgi.Controller):
 
         instance = self._get_server(context, req, id)
 
-        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
-                    context, instance.uuid)
-
         try:
-            if self.compute_api.is_volume_backed_instance(context, instance,
-                                                          bdms):
-                img = instance['image_ref']
-                if not img:
-                    properties = bdms.root_metadata(
-                            context, self.compute_api.image_api,
-                            self.compute_api.volume_api)
-                    image_meta = {'properties': properties}
-                else:
-                    image_meta = self.compute_api.image_api.get(context, img)
-
-                image = self.compute_api.snapshot_volume_backed(
-                                                       context,
-                                                       instance,
-                                                       image_meta,
-                                                       image_name,
-                                                       extra_properties=props)
-            else:
-                image = self.compute_api.snapshot(context,
-                                                  instance,
-                                                  image_name,
-                                                  extra_properties=props)
+            image = self.compute_api.snapshot(context,
+                                              instance,
+                                              image_name,
+                                              extra_properties=props)
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                         'createImage')

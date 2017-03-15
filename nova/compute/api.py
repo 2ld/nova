@@ -350,7 +350,7 @@ class API(base.Base):
                 raise exception.OnsetFileContentLimitExceeded()
 
     def _check_num_instances_quota(self, context, instance_type, min_count,
-                                   max_count):
+                                   max_count, project_id=None, user_id=None):
         """Enforce quota limits on number of instances created."""
 
         # Determine requested cores and ram
@@ -362,7 +362,8 @@ class API(base.Base):
         try:
             quotas = objects.Quotas(context)
             quotas.reserve(context, instances=max_count,
-                           cores=req_cores, ram=req_ram)
+                           cores=req_cores, ram=req_ram,
+                           project_id=project_id, user_id=user_id)
         except exception.OverQuota as exc:
             # OK, we exceeded quota; let's figure out why...
             quotas = exc.kwargs['quotas']
@@ -1773,10 +1774,15 @@ class API(base.Base):
         """Terminate an instance."""
         LOG.debug('Going to try to soft delete instance',
                   instance=instance)
-
-        self._delete(context, instance, 'soft_delete', self._do_soft_delete,
-                     task_state=task_states.SOFT_DELETING,
-                     deleted_at=timeutils.utcnow())
+        if instance['vm_state'] == vm_states.SOFT_DELETED:
+            LOG.warn("Instance %s is soft delete state" % (instance.uuid))
+            reason = ("The instance is %s state" % (instance.vm_state))
+            raise exception.InstanceTerminationFailure(reason=reason)
+        else:
+            self._delete(context, instance, 'soft_delete',
+                         self._do_soft_delete,
+                         task_state=task_states.SOFT_DELETING,
+                         deleted_at=timeutils.utcnow())
 
     def _delete_instance(self, context, instance):
         self._delete(context, instance, 'delete', self._do_delete,
@@ -1799,8 +1805,9 @@ class API(base.Base):
         """Restore a previously deleted (but not reclaimed) instance."""
         # Reserve quotas
         flavor = instance.get_flavor()
+        project_id, user_id = quotas_obj.ids_from_instance(context, instance)
         num_instances, quotas = self._check_num_instances_quota(
-                context, flavor, 1, 1)
+            context, flavor, 1, 1, project_id=project_id, user_id=user_id)
 
         self._record_action_start(context, instance, instance_actions.RESTORE)
 
@@ -2091,6 +2098,8 @@ class API(base.Base):
             'image_type': image_type,
         }
         image_ref = instance.image_ref
+        if not image_ref:
+            image_ref = compute_utils.get_image_ref(context, instance)
         sent_meta = compute_utils.get_image_metadata(
             context, self.image_api, image_ref, instance)
 

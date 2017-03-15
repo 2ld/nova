@@ -348,6 +348,25 @@ class Image(object):
         raise exception.ImageUnacceptable(image_id=image_id_or_uri,
                                           reason=reason)
 
+    def direct_snapshot(self, context, snapshot_name, image_format, image_id,
+                        base_image_id):
+        """Prepare a snapshot for direct reference from glance
+
+        :raises: exception.ImageUnacceptable if it cannot be
+                 referenced directly in the specified image format
+        :returns: URL to be given to glance
+        """
+        raise NotImplementedError(_('direct_snapshot() is not implemented'))
+
+    def cleanup_direct_snapshot(self, location, also_destroy_volume=False,
+                                ignore_errors=False):
+        """Performs any cleanup actions required after calling
+        direct_snapshot(), for graceful exception handling and the like.
+
+        This should be a no-op on any backend where it is not implemented.
+        """
+        pass
+
 
 class Raw(Image):
     def __init__(self, instance=None, disk_name=None, path=None):
@@ -616,16 +635,17 @@ class Rbd(Image):
         if path:
             try:
                 self.rbd_name = path.split('/')[1]
+                self.pool = path.split('/')[0].split(':')[1]
             except IndexError:
                 raise exception.InvalidDevicePath(path=path)
         else:
             self.rbd_name = '%s_%s' % (instance['uuid'], disk_name)
+            self.pool = CONF.libvirt.images_rbd_pool
 
         if not CONF.libvirt.images_rbd_pool:
             raise RuntimeError(_('You should specify'
                                  ' images_rbd_pool'
                                  ' flag to use rbd images.'))
-        self.pool = CONF.libvirt.images_rbd_pool
         self.discard_mode = get_hw_disk_discard(
                 CONF.libvirt.hw_disk_discard)
         self.rbd_user = CONF.libvirt.rbd_user
@@ -737,6 +757,97 @@ class Rbd(Image):
         reason = _('No image locations are accessible')
         raise exception.ImageUnacceptable(image_id=image_id_or_uri,
                                           reason=reason)
+
+    def _get_parent_pool(self, context, base_image_id, fsid):
+        parent_pool = None
+        try:
+            # The easy way -- the image is an RBD clone, so use the parent
+            # images' storage pool
+            parent_pool, _im, _snap = self.driver.parent_info(self.rbd_name)
+        except exception.ImageUnacceptable:
+            # The hard way -- the image is itself a parent, so ask Glance
+            # where it came from
+            LOG.debug('No parent info for %s; asking the Image API where its '
+                      'store is', base_image_id)
+            try:
+                image_meta = IMAGE_API.get(context, base_image_id,
+                                           include_locations=True)
+            except Exception as e:
+                LOG.debug('Unable to get image %(image_id)s; error: %(error)s',
+                          {'image_id': base_image_id, 'error': e})
+                image_meta = {}
+
+            # Find the first location that is in the same RBD cluster
+            for location in image_meta.get('locations', []):
+                try:
+                    parent_fsid, parent_pool, _im, _snap = \
+                        self.driver.parse_url(location['url'])
+                    if parent_fsid == fsid:
+                        break
+                    else:
+                        parent_pool = None
+                except exception.ImageUnacceptable:
+                    continue
+
+        if not parent_pool:
+            raise exception.ImageUnacceptable(
+                _('Cannot determine the parent storage pool for %s; '
+                  'cannot determine where to store images') %
+                base_image_id)
+
+        return parent_pool
+
+    def direct_snapshot(self, context, snapshot_name, image_format,
+                        image_id, base_image_id):
+        """Creates an RBD snapshot directly.
+        """
+        fsid = self.driver.get_fsid()
+        # NOTE(nic): Nova has zero comprehension of how Glance's image store
+        # is configured, but we can infer what storage pool Glance is using
+        # by looking at the parent image.  If using authx, write access should
+        # be enabled on that pool for the Nova user
+        parent_pool = self._get_parent_pool(context, base_image_id, fsid)
+
+        # Snapshot the disk and clone it into Glance's storage pool.  librbd
+        # requires that snapshots be set to "protected" in order to clone them
+        self.driver.create_snap(self.rbd_name, snapshot_name,
+                                pool=self.pool, protect=True)
+        location = {'url': 'rbd://%(fsid)s/%(pool)s/%(image)s/%(snap)s' %
+                    dict(fsid=fsid,
+                         pool=self.pool,
+                         image=self.rbd_name,
+                         snap=snapshot_name)}
+        try:
+            self.driver.clone(location, image_id, dest_pool=parent_pool)
+            # Flatten the image, which detaches it from the source snapshot
+            self.driver.flatten(image_id, pool=parent_pool)
+        finally:
+            # all done with the source snapshot, clean it up
+            self.cleanup_direct_snapshot(location)
+
+        # Glance makes a protected snapshot called 'snap' on uploaded
+        # images and hands it out, so we'll do that too.  The name of
+        # the snapshot doesn't really matter, this just uses what the
+        # glance-store rbd backend sets (which is not configurable).
+        self.driver.create_snap(image_id, 'snap', pool=parent_pool,
+                                protect=True)
+        return ('rbd://%(fsid)s/%(pool)s/%(image)s/snap' %
+                dict(fsid=fsid, pool=parent_pool, image=image_id))
+
+    def cleanup_direct_snapshot(self, location, also_destroy_volume=False,
+                                ignore_errors=False):
+        """Unprotects and destroys the name snapshot.
+
+        With also_destroy_volume=True, it will also cleanup/destroy the parent
+        volume.  This is useful for cleaning up when the target volume fails
+        to snapshot properly.
+        """
+        if location:
+            _fsid, _pool, _im, _snap = self.driver.parse_url(location['url'])
+            self.driver.remove_snap(_im, _snap, pool=_pool, force=True,
+                                    ignore_errors=ignore_errors)
+            if also_destroy_volume:
+                self.driver.destroy_volume(_im, pool=_pool)
 
 
 class Backend(object):

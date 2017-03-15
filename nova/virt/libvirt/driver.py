@@ -1635,6 +1635,8 @@ class LibvirtDriver(driver.ComputeDriver):
             raise exception.InstanceNotRunning(instance_id=instance['uuid'])
 
         base_image_ref = instance['image_ref']
+        if not base_image_ref:
+            base_image_ref = compute_utils.get_image_ref(context, instance)
 
         base = compute_utils.get_image_metadata(
             context, self._image_api, base_image_ref, instance)
@@ -1714,46 +1716,86 @@ class LibvirtDriver(driver.ComputeDriver):
                      instance=instance)
 
         update_task_state(task_state=task_states.IMAGE_PENDING_UPLOAD)
-        snapshot_directory = CONF.libvirt.snapshots_directory
-        fileutils.ensure_tree(snapshot_directory)
-        with utils.tempdir(dir=snapshot_directory) as tmpdir:
-            try:
-                out_path = os.path.join(tmpdir, snapshot_name)
-                if live_snapshot:
-                    # NOTE(xqueralt): libvirt needs o+x in the temp directory
-                    os.chmod(tmpdir, 0o701)
-                    self._live_snapshot(virt_dom, disk_path, out_path,
-                                        image_format)
-                else:
-                    snapshot_backend.snapshot_extract(out_path, image_format)
-            finally:
-                new_dom = None
-                # NOTE(dkang): because previous managedSave is not called
-                #              for LXC, _create_domain must not be called.
-                if CONF.libvirt.virt_type != 'lxc' and not live_snapshot:
-                    if state == power_state.RUNNING:
-                        new_dom = self._create_domain(domain=virt_dom)
-                    elif state == power_state.PAUSED:
-                        new_dom = self._create_domain(domain=virt_dom,
-                                launch_flags=libvirt.VIR_DOMAIN_START_PAUSED)
-                    if new_dom is not None:
-                        self._attach_pci_devices(new_dom,
-                            pci_manager.get_instance_pci_devs(instance))
-                        self._attach_sriov_ports(context, instance, new_dom)
-                LOG.info(_LI("Snapshot extracted, beginning image upload"),
-                         instance=instance)
 
-            # Upload that image to the image service
-
+        try:
             update_task_state(task_state=task_states.IMAGE_UPLOADING,
-                     expected_state=task_states.IMAGE_PENDING_UPLOAD)
-            with libvirt_utils.file_open(out_path) as image_file:
-                self._image_api.update(context,
-                                       image_id,
-                                       metadata,
-                                       image_file)
-                LOG.info(_LI("Snapshot image upload complete"),
-                         instance=instance)
+                              expected_state=task_states.IMAGE_PENDING_UPLOAD)
+            metadata['location'] = snapshot_backend.direct_snapshot(
+                context, snapshot_name, image_format, image_id,
+                base_image_ref)
+            self._snapshot_domain(context, live_snapshot, virt_dom, state,
+                                  instance)
+            self._image_api.update(context, image_id, metadata,
+                                   purge_props=False)
+        except (NotImplementedError, exception.ImageUnacceptable,
+                exception.Forbidden) as e:
+            if type(e) != NotImplementedError:
+                LOG.warning(_LW('Performing standard snapshot because direct '
+                                'snapshot failed: %(error)s'), {'error': e})
+            failed_snap = metadata.pop('location', None)
+            if failed_snap:
+                failed_snap = {'url': str(failed_snap)}
+            snapshot_backend.cleanup_direct_snapshot(failed_snap,
+                                                     also_destroy_volume=True,
+                                                     ignore_errors=True)
+            update_task_state(task_state=task_states.IMAGE_PENDING_UPLOAD,
+                              expected_state=task_states.IMAGE_UPLOADING)
+
+            snapshot_directory = CONF.libvirt.snapshots_directory
+            fileutils.ensure_tree(snapshot_directory)
+            with utils.tempdir(dir=snapshot_directory) as tmpdir:
+                try:
+                    out_path = os.path.join(tmpdir, snapshot_name)
+                    if live_snapshot:
+                        # NOTE(xqueralt): libvirt needs o+x in the temp
+                        # directory
+                        os.chmod(tmpdir, 0o701)
+                        self._live_snapshot(virt_dom, disk_path, out_path,
+                                            image_format)
+                    else:
+                        snapshot_backend.snapshot_extract(out_path,
+                                                          image_format)
+                finally:
+                    self._snapshot_domain(context, live_snapshot, virt_dom,
+                                          state, instance)
+                    LOG.info(_LI("Snapshot extracted, beginning image upload"),
+                             instance=instance)
+
+                # Upload that image to the image service
+                update_task_state(task_state=task_states.IMAGE_UPLOADING,
+                        expected_state=task_states.IMAGE_PENDING_UPLOAD)
+                with libvirt_utils.file_open(out_path) as image_file:
+                    self._image_api.update(context,
+                                           image_id,
+                                           metadata,
+                                           image_file)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_LE("Failed to snapshot image"))
+                failed_snap = metadata.pop('location', None)
+                if failed_snap:
+                    failed_snap = {'url': str(failed_snap)}
+                snapshot_backend.cleanup_direct_snapshot(
+                        failed_snap, also_destroy_volume=True,
+                        ignore_errors=True)
+
+        LOG.info(_LI("Snapshot image upload complete"), instance=instance)
+
+    def _snapshot_domain(self, context, live_snapshot, virt_dom, state,
+                         instance):
+        new_dom = None
+        # NOTE(dkang): because previous managedSave is not called
+        #              for LXC, _create_domain must not be called.
+        if CONF.libvirt.virt_type != 'lxc' and not live_snapshot:
+            if state == power_state.RUNNING:
+                new_dom = self._create_domain(domain=virt_dom)
+            elif state == power_state.PAUSED:
+                new_dom = self._create_domain(domain=virt_dom,
+                        launch_flags=libvirt.VIR_DOMAIN_START_PAUSED)
+            if new_dom is not None:
+                self._attach_pci_devices(new_dom,
+                    pci_manager.get_instance_pci_devs(instance))
+                self._attach_sriov_ports(context, instance, new_dom)
 
     @staticmethod
     def _wait_for_block_job(domain, disk_path, abort_on_error=False,
@@ -4339,7 +4381,8 @@ class LibvirtDriver(driver.ComputeDriver):
         err = None
         try:
             if xml:
-                err = _LE('Error defining a domain with XML: %s') % xml
+                err = _LE('Error defining a domain with XML: %s') \
+                    % strutils.safe_decode(xml, errors='ignore')
                 domain = self._conn.defineXML(xml)
 
             if power_on:
@@ -6458,7 +6501,13 @@ class LibvirtDriver(driver.ComputeDriver):
         # ensure directories exist and are writable
         instance_path = libvirt_utils.get_instance_path(instance)
         LOG.debug('Checking instance files accessibility %s', instance_path)
-        return os.access(instance_path, os.W_OK)
+        shared_instance_path = os.access(instance_path, os.W_OK)
+        # NOTE(flwang): For shared block storage scenario, the file system is
+        # not really shared by the two hosts, but the volume of evacuated
+        # instance is reachable.
+        shared_block_storage = (self.image_backend.backend().
+                                is_shared_block_storage())
+        return shared_instance_path or shared_block_storage
 
     def inject_network_info(self, instance, nw_info):
         self.firewall_driver.setup_basic_filtering(instance, nw_info)

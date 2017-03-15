@@ -24,6 +24,7 @@ from nova import block_device
 from nova.compute import flavors
 from nova.compute import power_state
 from nova.compute import task_states
+from nova import compute
 from nova import exception
 from nova.i18n import _LW
 from nova.network import model as network_model
@@ -218,6 +219,20 @@ def get_image_metadata(context, image_api, image_id_or_uri, instance):
 
     # Convert the system metadata to image metadata
     return utils.get_image_from_system_metadata(system_meta)
+
+
+def get_image_ref(context, instance):
+    """Helper method to get image_ref."""
+    image_ref = None
+    compute_api = compute.API()
+    bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+        context, instance['uuid'])
+    if compute_api.is_volume_backed_instance(context, instance, bdms):
+        props = bdms.root_metadata(
+            context, compute_api.image_api,
+            compute_api.volume_api)
+        image_ref = props['image_id']
+    return image_ref
 
 
 def get_value_from_system_metadata(instance, key, type, default):
