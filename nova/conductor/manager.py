@@ -18,6 +18,7 @@ import copy
 import itertools
 
 from oslo import messaging
+from oslo.config import cfg
 import six
 
 from nova.api.ec2 import ec2utils
@@ -47,6 +48,12 @@ from nova import quota
 from nova.scheduler import client as scheduler_client
 from nova.scheduler import driver as scheduler_driver
 from nova.scheduler import utils as scheduler_utils
+
+
+CONF = cfg.CONF
+CONF.import_opt('ram_allocation_ratio', 'nova.scheduler.filters.ram_filter')
+CONF.import_opt('cpu_allocation_ratio', 'nova.scheduler.filters.core_filter')
+CONF.import_opt('disk_allocation_ratio', 'nova.scheduler.filters.disk_filter')
 
 LOG = logging.getLogger(__name__)
 
@@ -724,6 +731,7 @@ class ComputeTaskManager(base.Base):
 
         with compute_utils.EventReporter(context, 'rebuild_server',
                                           instance.uuid):
+            compute_node_info = None
             if not host:
                 # NOTE(lcostantino): Retrieve scheduler filters for the
                 # instance when the feature is available
@@ -744,7 +752,32 @@ class ComputeTaskManager(base.Base):
                                  'task_state': None}, ex, request_spec)
                         LOG.warning(_("No valid host found for rebuild"),
                                       instance=instance)
-
+            else:
+                check_resource_enough_value = \
+                    self._check_destination_has_enough_resource(context, host, instance)
+                if check_resource_enough_value:
+                    with excutils.save_and_reraise_exception():
+                        request_spec = scheduler_utils.build_request_spec(
+                            context, image_ref, [instance])
+                        self._set_vm_state_and_notify(context,
+                                 'rebuild_server',
+                                 {'vm_state': instance.vm_state,
+                                 'task_state': None},
+                                 exception.NoValidHost,
+                                 request_spec)
+                        LOG.warning(_("No valid host found for rebuild"),
+                                    instance=instance)
+                        raise exception.NoValidHost
+            if compute_node_info is None:
+                compute_node_info = self.db.service_get_by_compute_host(context, host)['compute_node'][0]
+            limits = {
+                "memory_mb": CONF.ram_allocation_ratio *
+                             compute_node_info['memory_mb'],
+                "vcpu": CONF.cpu_allocation_ratio *
+                        compute_node_info['vcpus'],
+                "disk_gb": CONF.disk_allocation_ratio *
+                           compute_node_info['local_gb']
+            }
             self.compute_rpcapi.rebuild_instance(context,
                     instance=instance,
                     new_pass=new_pass,
@@ -756,4 +789,34 @@ class ComputeTaskManager(base.Base):
                     recreate=recreate,
                     on_shared_storage=on_shared_storage,
                     preserve_ephemeral=preserve_ephemeral,
-                    host=host)
+                    host=host,
+                    limits=limits)
+
+    def _check_destination_has_enough_resource(self, context, host, instance):
+        '''Check the target host's resources about cpu and memory.
+
+        :param context: request context
+        :param host: Target host
+        :param instance: The instance to evacuate
+        :return:
+        '''
+        compute_node_info = self._get_compute_info(context, host)
+        memory_mb = compute_node_info['memory_mb']
+        vcpus = compute_node_info['vcpus']
+        memory_mb_used = compute_node_info['memory_mb_used']
+        vcpus_used = compute_node_info['vcpus_used']
+        ram_allocation_ratio = CONF.ram_allocation_ratio
+        cpu_allocation_ratio = CONF.cpu_allocation_ratio
+        avail_memory = memory_mb * ram_allocation_ratio - memory_mb_used
+        avail_cpu = vcpus * cpu_allocation_ratio - vcpus_used
+        mem_inst = instance.memory_mb
+        cpu_inst = instance.vcpus
+        if not mem_inst or avail_memory <= mem_inst:
+            return True
+        if not cpu_inst or avail_cpu <= cpu_inst:
+            return True
+        return False
+
+    def _get_compute_info(self, context, host):
+        service_ref = self.db.service_get_by_compute_host(context, host)
+        return service_ref['compute_node'][0]

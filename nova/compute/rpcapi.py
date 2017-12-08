@@ -583,7 +583,7 @@ class ComputeAPI(object):
     def rebuild_instance(self, ctxt, instance, new_pass, injected_files,
             image_ref, orig_image_ref, orig_sys_metadata, bdms,
             recreate=False, on_shared_storage=False, host=None,
-            preserve_ephemeral=False, kwargs=None):
+            preserve_ephemeral=False, limits=None, kwargs=None):
         # NOTE(danms): kwargs is only here for cells compatibility, don't
         # actually send it to compute
         extra = {'preserve_ephemeral': preserve_ephemeral}
@@ -596,7 +596,7 @@ class ComputeAPI(object):
                    orig_image_ref=orig_image_ref,
                    orig_sys_metadata=orig_sys_metadata, bdms=bdms,
                    recreate=recreate, on_shared_storage=on_shared_storage,
-                   **extra)
+                   limits=limits, **extra)
 
     def refresh_provider_fw_rules(self, ctxt, host):
         version = '3.0'
